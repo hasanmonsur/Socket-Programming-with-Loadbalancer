@@ -1,0 +1,8 @@
+docker run -d \
+  --name espocrm \
+  -p 8080:80 \
+  -v espocrm_data:/var/www/html \
+  espocrm/espocrm:latest
+
+
+YetiForce CRM

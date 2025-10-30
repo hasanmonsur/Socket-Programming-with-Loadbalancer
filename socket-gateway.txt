@@ -1,0 +1,190 @@
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Collections.Concurrent;
+
+var backendServers = new List<(string host, int port, int weight)>
+{
+    ("192.168.1.7", 9001, 1),
+    ("192.168.1.7", 9002, 1),
+    ("192.168.1.7", 9003, 1),
+    ("192.168.1.7", 9004, 1)
+};
+
+// Holds current load count + health state
+var backendStatus = new ConcurrentDictionary<(string host, int port, int weight), (int load, bool healthy)>();
+
+foreach (var backend in backendServers)
+    backendStatus[backend] = (0, false); // start as unhealthy, health check will update
+
+const int gatewayPort = 9000;
+var listener = new TcpListener(IPAddress.Any, gatewayPort);
+
+Console.Title = $"⚙️ Gateway Load Balancer [.NET 8] — Port {gatewayPort}";
+Console.WriteLine($"🚀 Gateway starting on port {gatewayPort}");
+listener.Start();
+
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) =>
+{
+    e.Cancel = true;
+    Console.WriteLine("\n🛑 Shutting down gateway...");
+    cts.Cancel();
+};
+
+// Start background health monitor
+_ = Task.Run(() => HealthMonitorAsync(backendServers, backendStatus, cts.Token));
+
+try
+{
+    while (!cts.Token.IsCancellationRequested)
+    {
+        var client = await listener.AcceptTcpClientAsync(cts.Token);
+        _ = Task.Run(() => HandleClientAsync(client, backendStatus, cts.Token));
+    }
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("✅ Gateway stopped gracefully.");
+}
+finally
+{
+    listener.Stop();
+}
+
+return;
+
+// ====================== Helper Methods ======================
+
+static async Task HandleClientAsync(
+    TcpClient client,
+    ConcurrentDictionary<(string host, int port, int weight), (int load, bool healthy)> backendStatus,
+    CancellationToken token)
+{
+    var clientEndPoint = client.Client.RemoteEndPoint?.ToString() ?? "Unknown";
+    Console.WriteLine($"🔗 Client connected: {clientEndPoint}");
+
+    using var stream = client.GetStream();
+    var buffer = new byte[4096];
+
+    while (!token.IsCancellationRequested)
+    {
+        int read;
+        try
+        {
+            read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), token);
+            if (read == 0) break; // Client disconnected
+        }
+        catch (OperationCanceledException)
+        {
+            break;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠️ Error reading from client {clientEndPoint}: {ex.Message}");
+            break;
+        }
+
+        var message = Encoding.UTF8.GetString(buffer, 0, read);
+        Console.WriteLine($"📩 From {clientEndPoint}: {message}");
+
+        var backend = GetWeightedLeastLoadedBackend(backendStatus);
+        if (backend == default)
+        {
+            var noServerMsg = Encoding.UTF8.GetBytes("❌ No healthy backend available.\n");
+            await stream.WriteAsync(noServerMsg, token);
+            continue;
+        }
+
+        backendStatus.AddOrUpdate(backend, (1, true), (_, v) => (v.load + 1, v.healthy));
+        try
+        {
+            var response = await ForwardToBackendAsync((backend.host, backend.port), message, token);
+            await stream.WriteAsync(response, token);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Forwarding failed to {backend.host}:{backend.port} → {ex.Message}");
+            var errMsg = Encoding.UTF8.GetBytes($"❌ Backend error: {ex.Message}\n");
+            await stream.WriteAsync(errMsg, token);
+        }
+        finally
+        {
+            backendStatus.AddOrUpdate(backend, (0, true), (_, v) => (Math.Max(v.load - 1, 0), v.healthy));
+        }
+    }
+
+    client.Close();
+    Console.WriteLine($"❎ Client disconnected: {clientEndPoint}");
+}
+
+static async Task<byte[]> ForwardToBackendAsync((string host, int port) backend, string message, CancellationToken token)
+{
+    using var tcp = new TcpClient();
+    await tcp.ConnectAsync(backend.host, backend.port, token);
+    using var ns = tcp.GetStream();
+
+    var data = Encoding.UTF8.GetBytes(message);
+    await ns.WriteAsync(data, token);
+
+    var buffer = new byte[4096];
+    int read = await ns.ReadAsync(buffer.AsMemory(0, buffer.Length), token);
+    return buffer[..read];
+}
+
+// ---------- Weighted Load Balancing ----------
+static (string host, int port, int weight) GetWeightedLeastLoadedBackend(
+    ConcurrentDictionary<(string host, int port, int weight), (int load, bool healthy)> backendStatus)
+{
+    var healthyBackends = backendStatus.Where(x => x.Value.healthy).ToList();
+    if (healthyBackends.Count == 0)
+        return default;
+
+    // Weighted score: lower = better
+    return healthyBackends
+        .Select(b => new
+        {
+            backend = b.Key,
+            score = (double)b.Value.load / b.Key.weight
+        })
+        .OrderBy(b => b.score)
+        .First().backend;
+}
+
+// ---------- Periodic Health Checks ----------
+static async Task HealthMonitorAsync(
+    List<(string host, int port, int weight)> backendServers,
+    ConcurrentDictionary<(string host, int port, int weight), (int load, bool healthy)> backendStatus,
+    CancellationToken token)
+{
+    while (!token.IsCancellationRequested)
+    {
+        foreach (var backend in backendServers)
+        {
+            bool isAlive = await PingBackendAsync(backend.host, backend.port, token);
+            var prev = backendStatus.GetValueOrDefault(backend);
+            backendStatus[backend] = (prev.load, isAlive);
+
+            var status = isAlive ? "✅ UP" : "❌ DOWN";
+            Console.WriteLine($"HealthCheck → {backend.host}:{backend.port} = {status}");
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(10), token); // check every 10 s
+    }
+}
+
+static async Task<bool> PingBackendAsync(string host, int port, CancellationToken token)
+{
+    try
+    {
+        using var tcp = new TcpClient();
+        var connectTask = tcp.ConnectAsync(host, port, token).AsTask();
+        var timeout = Task.Delay(1000, token); // 1 s timeout
+        var completed = await Task.WhenAny(connectTask, timeout);
+        return completed == connectTask && tcp.Connected;
+    }
+    catch
+    {
+        return false;
+    }
+}
